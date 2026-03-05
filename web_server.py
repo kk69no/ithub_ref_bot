@@ -197,13 +197,21 @@ async def handle_auth_verify(request: web.Request) -> web.Response:
             student = fuzzy[0]
 
     if not student:
-        return web.json_response(
-            {
-                "error": f"Студент «{student_name}» не найден в базе реферальной программы. "
-                         "Обратитесь к администратору."
-            },
-            status=404,
-        )
+        # Студента нет в базе — создаём нового автоматически
+        logger.info(f"Студент не найден в БД, создаём: {student_name} ({student_group})")
+        try:
+            student = await db.add_student(
+                full_name=student_name,
+                group_name=student_group or "Не указана",
+                role="student",
+            )
+            logger.info(f"Создан новый студент: id={student['id']}, {student['full_name']}")
+        except Exception as e:
+            logger.error(f"Ошибка создания студента: {e}")
+            return web.json_response(
+                {"error": "Ошибка регистрации. Попробуйте ещё раз."},
+                status=500,
+            )
 
     if student.get("telegram_id"):
         return web.json_response(
