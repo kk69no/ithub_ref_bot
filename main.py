@@ -27,10 +27,9 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
 
     # Подключаем роутеры (порядок важен!)
-    from handlers import student, applicant, leaderboard, curator, admin
+    from handlers import student, applicant, curator, admin
     dp.include_router(student.router)
     dp.include_router(applicant.router)
-    dp.include_router(leaderboard.router)
     dp.include_router(curator.router)
     dp.include_router(admin.router)
 
