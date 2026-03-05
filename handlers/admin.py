@@ -1,577 +1,580 @@
-"""
-Админ-панель:
-- Изменение статусов абитуриентов (с автоматическим начислением)
-- Все заявки (фильтры, поиск)
-- Реестр выплат
-- Выгрузка в Excel
-- Статистика (дашборд)
-- Рассылка
-- Добавление студента
-"""
+"""Admin panel handlers for status management, payments, analytics and exports."""
+
 import io
-from aiogram import Router, F, Bot
-from aiogram.types import (
-    Message, CallbackQuery, BufferedInputFile,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-)
-from aiogram.filters import Command
+import json
+from datetime import datetime
+from aiogram import Router, F
+from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton, Document
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-import database as db
+from database import get_db, fuzzy_find_students, get_student_by_id, get_student_referrals
 from config import (
-    ADMIN_IDS, STATUSES, STATUS_ORDER,
-    PAYMENT_CONTRACT_STUDENT, PAYMENT_CONTRACT_CURATOR,
-    PAYMENT_ENROLLED_STUDENT, PAYMENT_ENROLLED_CURATOR,
+    ADMIN_IDS, ADMIN_NOTIFY_CHAT_ID, STATUSES, STATUS_ORDER,
+    PAYMENT_MIN, PAYMENT_MAX, PAYMENT_DEFAULT, STATUS_EMOJI
 )
-from utils.notifications import (
-    notify_student_status_change, notify_curator_status_change,
-)
+from utils.notifications import notify_admin, notify_student, notify_curator
 from utils.excel_export import export_full_report
 
 router = Router()
 
 
-# ─── Фильтр: только админы ──────────────────────────────────
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-# ─── FSM для админ-действий ─────────────────────────────────
 class AdminStates(StatesGroup):
-    search_query = State()
-    broadcast_target = State()
-    broadcast_text = State()
+    """States for admin operations."""
+    search_student = State()
+    select_student = State()
+    change_status = State()
+    manual_payment = State()
+    payment_amount = State()
+    payment_reason = State()
+    broadcast_message = State()
     add_student_name = State()
     add_student_group = State()
-    add_student_role = State()
+    add_student_email = State()
 
 
-# ─── /admin — главное меню админа ────────────────────────────
-ADMIN_MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="📋 Все заявки", callback_data="adm_all_referrals")],
-    [InlineKeyboardButton(text="🔍 Поиск", callback_data="adm_search")],
-    [InlineKeyboardButton(text="💳 Реестр выплат", callback_data="adm_payments")],
-    [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
-    [InlineKeyboardButton(text="📥 Выгрузка Excel", callback_data="adm_export")],
-    [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm_broadcast")],
-    [InlineKeyboardButton(text="➕ Добавить студента", callback_data="adm_add_student")],
-])
+def admin_only(func):
+    """Decorator to check admin access."""
+    async def wrapper(query_or_msg):
+        user_id = query_or_msg.from_user.id if hasattr(query_or_msg, 'from_user') else query_or_msg.user_id
+        if user_id not in ADMIN_IDS:
+            await query_or_msg.answer("❌ Доступ запрещен", show_alert=True)
+            return
+        return await func(query_or_msg)
+    return wrapper
 
 
-@router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Нет доступа.")
-        return
-    await message.answer(
-        "🔧 <b>Админ-панель</b>",
-        parse_mode="HTML",
-        reply_markup=ADMIN_MENU_KB,
-    )
-
-
-# ─── Все заявки ──────────────────────────────────────────────
-@router.callback_query(F.data == "adm_all_referrals")
-async def cb_all_referrals(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔", show_alert=True)
-        return
-
-    # Показываем фильтры по статусу
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📋 {STATUSES[s]}", callback_data=f"adm_filter_{s}")]
-        for s in STATUS_ORDER
-    ] + [
-        [InlineKeyboardButton(text="Все статусы", callback_data="adm_filter_all")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")],
+async def admin_menu_keyboard():
+    """Build admin menu keyboard."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Поиск студента", callback_data="admin_search")],
+        [InlineKeyboardButton(text="💰 Реестр платежей", callback_data="admin_payments")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📥 Экспорт", callback_data="admin_export")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="➕ Добавить студента", callback_data="admin_add_student")],
     ])
-    await callback.message.answer("Фильтр по статусу:", reply_markup=kb)
-    await callback.answer()
 
 
-@router.callback_query(F.data.startswith("adm_filter_"))
-async def cb_filter_referrals(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+@router.callback_query(F.data == "admin_menu")
+async def admin_menu_callback(query: CallbackQuery):
+    """Show admin menu."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
         return
 
-    status_key = callback.data.replace("adm_filter_", "")
-    status_filter = None if status_key == "all" else status_key
-    referrals = await db.get_all_referrals(status_filter=status_filter)
-
-    if not referrals:
-        await callback.message.answer("Нет заявок с таким фильтром.")
-        await callback.answer()
-        return
-
-    # Показываем до 20 записей
-    lines = [f"📋 <b>Заявки</b> ({len(referrals)} всего):\n"]
-    for r in referrals[:20]:
-        status_label = STATUSES.get(r["status"], r["status"])
-        lines.append(
-            f"• <b>{r['full_name']}</b> ({r['phone']})\n"
-            f"  Статус: {status_label} | Реферер: {r.get('referrer_name', '?')} ({r.get('group_name', '')})"
-        )
-
-    # Кнопки для изменения статуса
-    kb_buttons = []
-    for r in referrals[:10]:
-        kb_buttons.append([InlineKeyboardButton(
-            text=f"✏️ {r['full_name']} [{STATUSES.get(r['status'], '')}]",
-            callback_data=f"adm_status_{r['id']}",
-        )])
-    kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")])
-
-    await callback.message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
+    keyboard = await admin_menu_keyboard()
+    await query.message.edit_text(
+        "🔐 *Админ-панель*\n\nВыберите действие:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
-    await callback.answer()
+    await query.answer()
 
 
-# ─── Изменение статуса ───────────────────────────────────────
-@router.callback_query(F.data.startswith("adm_status_"))
-async def cb_change_status_select(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+@router.callback_query(F.data == "admin_search")
+async def admin_search_callback(query: CallbackQuery, state: FSMContext):
+    """Start student search."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
         return
 
-    referral_id = int(callback.data.replace("adm_status_", ""))
-    referral = await db.get_referral_by_id(referral_id)
-    if not referral:
-        await callback.answer("Заявка не найдена.", show_alert=True)
+    await state.set_state(AdminStates.search_student)
+    await query.message.edit_text(
+        "🔍 Введите имя или ID студента для поиска:",
+        parse_mode="Markdown"
+    )
+    await query.answer()
+
+
+@router.message(AdminStates.search_student)
+async def search_student_handler(message: Message, state: FSMContext):
+    """Handle student search."""
+    if message.from_user.id not in ADMIN_IDS:
         return
 
-    current_idx = STATUS_ORDER.index(referral["status"]) if referral["status"] in STATUS_ORDER else 0
-    # Показать только следующие статусы
-    available = STATUS_ORDER[current_idx + 1:]
+    db = await get_db()
 
-    if not available:
-        await callback.answer("Этот абитуриент уже на максимальном статусе.", show_alert=True)
+    try:
+        search_query = message.text.strip()
+        students = await fuzzy_find_students(db, search_query, limit=10)
+
+        if not students:
+            await message.answer("❌ Студентов не найдено")
+            return
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{s['name']} (ID: {s['user_id']})",
+                callback_data=f"admin_student:{s['user_id']}"
+            )]
+            for s in students
+        ])
+
+        await message.answer(
+            "📋 Найденные студенты:",
+            reply_markup=keyboard
+        )
+        await state.clear()
+
+    finally:
+        await db.close()
+
+
+@router.callback_query(F.data.startswith("admin_student:"))
+async def admin_student_callback(query: CallbackQuery, state: FSMContext):
+    """Show student admin panel."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
         return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    user_id = int(query.data.split(":")[1])
+    db = await get_db()
+
+    try:
+        student = await get_student_by_id(db, user_id)
+        if not student:
+            await query.answer("❌ Студент не найден", show_alert=True)
+            return
+
+        referrals = await get_student_referrals(db, user_id)
+
+        text = f"👤 *{student['name']}*\n\n"
+        text += f"ID: `{user_id}`\n"
+        text += f"Группа: *{student['group']}*\n"
+        text += f"Email: `{student['email']}`\n"
+        text += f"Статус: {STATUS_EMOJI.get(student['status'], '•')} {student['status']}\n"
+        text += f"Рефералов: *{len(referrals)}*\n"
+
+        # Count referrals by status
+        for status in STATUSES:
+            count = len([r for r in referrals if r['status'] == status])
+            if count > 0:
+                text += f"  {STATUS_EMOJI.get(status, '•')} {status}: {count}\n"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Изменить статус", callback_data=f"admin_change_status:{user_id}")],
+            [InlineKeyboardButton(text="💸 Ручная выплата", callback_data=f"admin_manual_payment:{user_id}")],
+            [InlineKeyboardButton(text="📋 Рефералы", callback_data=f"student_referrals:{user_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_menu")],
+        ])
+
+        await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+    finally:
+        await db.close()
+
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("admin_change_status:"))
+async def admin_change_status_callback(query: CallbackQuery, state: FSMContext):
+    """Show status change options."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    user_id = int(query.data.split(":")[1])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"→ {STATUSES[s]}",
-            callback_data=f"adm_set_{referral_id}_{s}",
+            text=f"{STATUS_EMOJI.get(status, '•')} {status}",
+            callback_data=f"confirm_status:{user_id}:{i}"
         )]
-        for s in available
-    ] + [[InlineKeyboardButton(text="❌ Отмена", callback_data="adm_back")]])
+        for i, status in enumerate(STATUS_ORDER)
+    ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_student:{user_id}")]])
 
-    await callback.message.answer(
-        f"Изменить статус <b>{referral['full_name']}</b>\n"
-        f"Текущий: {STATUSES.get(referral['status'], referral['status'])}\n\n"
-        f"Выберите новый статус:",
-        parse_mode="HTML",
-        reply_markup=kb,
+    await query.message.edit_text(
+        "🔄 Выберите новый статус:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
-    await callback.answer()
+    await query.answer()
 
 
-@router.callback_query(F.data.startswith("adm_set_"))
-async def cb_set_status(callback: CallbackQuery, bot: Bot):
-    if not is_admin(callback.from_user.id):
+@router.callback_query(F.data.startswith("confirm_status:"))
+async def confirm_status_callback(query: CallbackQuery):
+    """Confirm and apply status change with auto-payment."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
         return
 
-    parts = callback.data.replace("adm_set_", "").split("_", 1)
-    referral_id = int(parts[0])
-    new_status = parts[1]
+    parts = query.data.split(":")
+    user_id = int(parts[1])
+    status_idx = int(parts[2])
 
-    referral = await db.get_referral_by_id(referral_id)
-    if not referral:
-        await callback.answer("Заявка не найдена.", show_alert=True)
-        return
+    new_status = STATUS_ORDER[status_idx]
 
-    # Обновляем статус
-    await db.update_referral_status(referral_id, new_status)
+    db = await get_db()
 
-    # ─── Автоначисление при contract / enrolled ──────
-    referrer = await db.get_student_by_id(referral["referrer_id"])
-    student_amount = 0
-    curator_amount = 0
+    try:
+        student = await get_student_by_id(db, user_id)
+        old_status = student['status']
 
-    if new_status == "contract":
-        # Проверяем, что ещё не начисляли
-        if not await db.check_payment_exists(referral_id, "contract_referrer"):
-            await db.add_payment(referrer["id"], referral_id,
-                                 PAYMENT_CONTRACT_STUDENT, "contract_referrer")
-            student_amount = PAYMENT_CONTRACT_STUDENT
-
-        curator = await db.get_curator_for_group(referrer["group_name"])
-        if curator and not await db.check_payment_exists(referral_id, "contract_curator"):
-            await db.add_payment(curator["id"], referral_id,
-                                 PAYMENT_CONTRACT_CURATOR, "contract_curator")
-            curator_amount = PAYMENT_CONTRACT_CURATOR
-
-    elif new_status == "enrolled":
-        if not await db.check_payment_exists(referral_id, "enrolled_referrer"):
-            await db.add_payment(referrer["id"], referral_id,
-                                 PAYMENT_ENROLLED_STUDENT, "enrolled_referrer")
-            student_amount = PAYMENT_ENROLLED_STUDENT
-
-        curator = await db.get_curator_for_group(referrer["group_name"])
-        if curator and not await db.check_payment_exists(referral_id, "enrolled_curator"):
-            await db.add_payment(curator["id"], referral_id,
-                                 PAYMENT_ENROLLED_CURATOR, "enrolled_curator")
-            curator_amount = PAYMENT_ENROLLED_CURATOR
-
-    # ─── Уведомления ─────────────────────────────────
-    if referrer and referrer.get("telegram_id") and student_amount:
-        await notify_student_status_change(
-            bot, referrer["telegram_id"],
-            referral["full_name"], new_status, student_amount,
+        # Update student status
+        await db.execute(
+            "UPDATE students SET status = ? WHERE user_id = ?",
+            [new_status, user_id]
         )
 
-    if new_status in ("contract", "enrolled"):
-        curator = await db.get_curator_for_group(referrer["group_name"])
-        if curator and curator.get("telegram_id") and curator_amount:
-            await notify_curator_status_change(
-                bot, curator["telegram_id"],
-                referrer["full_name"], referral["full_name"],
-                new_status, curator_amount,
+        # Auto-payment if status changed to accepted
+        payment_made = False
+        if new_status == "✅ Принят" and old_status != "✅ Принят":
+            amount = PAYMENT_DEFAULT
+            await db.execute(
+                """
+                INSERT INTO payments (user_id, amount, reason, status, created_at)
+                VALUES (?, ?, ?, 'completed', ?)
+                """,
+                [user_id, amount, "Автоматическая выплата при принятии", datetime.now().isoformat()]
             )
+            payment_made = True
 
-    status_label = STATUSES.get(new_status, new_status)
-    pay_info = ""
-    if student_amount:
-        pay_info += f"\n💰 Начислено студенту: {student_amount} ₽"
-    if curator_amount:
-        pay_info += f"\n💰 Начислено куратору: {curator_amount} ₽"
+        # Handle "Оплачен" status
+        if new_status == "💸 Оплачен":
+            # Check if payment exists
+            payment = await db.fetchone(
+                "SELECT * FROM payments WHERE user_id = ? AND status = 'completed' ORDER BY created_at DESC LIMIT 1",
+                [user_id]
+            )
+            if not payment:
+                # Create payment if not exists
+                await db.execute(
+                    """
+                    INSERT INTO payments (user_id, amount, reason, status, created_at)
+                    VALUES (?, ?, ?, 'completed', ?)
+                    """,
+                    [user_id, PAYMENT_DEFAULT, "Выплата при смене статуса", datetime.now().isoformat()]
+                )
+                payment_made = True
 
-    await callback.message.answer(
-        f"✅ Статус <b>{referral['full_name']}</b> изменён на «{status_label}».{pay_info}",
-        parse_mode="HTML",
-    )
-    await callback.answer()
+        await db.commit()
 
-
-# ─── Поиск ───────────────────────────────────────────────────
-@router.callback_query(F.data == "adm_search")
-async def cb_search(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AdminStates.search_query)
-    await callback.message.answer("🔍 Введите имя или телефон для поиска:")
-    await callback.answer()
-
-
-@router.message(AdminStates.search_query)
-async def process_search(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-
-    results = await db.search_referrals(message.text.strip())
-    await state.clear()
-
-    if not results:
-        await message.answer("Ничего не найдено.")
-        return
-
-    lines = [f"🔍 Результаты ({len(results)}):\n"]
-    kb_buttons = []
-    for r in results[:10]:
-        status_label = STATUSES.get(r["status"], r["status"])
-        lines.append(
-            f"• <b>{r['full_name']}</b> ({r['phone']})\n"
-            f"  Статус: {status_label} | Реферер: {r.get('referrer_name', '?')}"
+        # Notify student
+        await notify_student(
+            user_id,
+            f"✅ Ваш статус обновлен: {new_status}\n" +
+            (f"💰 Вам выплачено: {PAYMENT_DEFAULT}₽" if payment_made else "")
         )
-        kb_buttons.append([InlineKeyboardButton(
-            text=f"✏️ {r['full_name']}",
-            callback_data=f"adm_status_{r['id']}",
-        )])
 
-    kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")])
-    await message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
-    )
-
-
-# ─── Реестр выплат ───────────────────────────────────────────
-@router.callback_query(F.data == "adm_payments")
-async def cb_payments(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏳ К выплате", callback_data="adm_pay_pending")],
-        [InlineKeyboardButton(text="✅ Выплачено", callback_data="adm_pay_paid")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")],
-    ])
-    await callback.message.answer("Реестр выплат — выберите фильтр:", reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("adm_pay_"))
-async def cb_payments_filter(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    status = callback.data.replace("adm_pay_", "")
-    payments = await db.get_all_payments(status_filter=status)
-
-    if not payments:
-        await callback.message.answer("Нет записей.")
-        await callback.answer()
-        return
-
-    type_labels = {
-        "contract_referrer": "Договор (студ.)",
-        "contract_curator": "Договор (кур.)",
-        "enrolled_referrer": "Зачисл. (студ.)",
-        "enrolled_curator": "Зачисл. (кур.)",
-    }
-
-    lines = [f"💳 <b>Выплаты [{status}]</b> ({len(payments)}):\n"]
-    kb_buttons = []
-    for p in payments[:15]:
-        label = type_labels.get(p["type"], p["type"])
-        lines.append(
-            f"• {p.get('recipient_name', '?')} — {p['amount']} ₽ ({label})\n"
-            f"  За: {p.get('referral_name', '?')}"
+        # Notify admin
+        await notify_admin(
+            f"📝 Статус {student['name']} изменен на {new_status}\n" +
+            (f"💰 Автоматическая выплата: {PAYMENT_DEFAULT}₽" if payment_made else "")
         )
-        if status == "pending":
-            kb_buttons.append([InlineKeyboardButton(
-                text=f"✅ Выплатить: {p.get('recipient_name', '?')} {p['amount']}₽",
-                callback_data=f"adm_markpaid_{p['id']}",
-            )])
 
-    kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")])
-    await callback.message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
+        await query.answer("✅ Статус изменен", show_alert=True)
+
+        # Return to student panel
+        await admin_student_callback(query, None)
+
+    finally:
+        await db.close()
+
+
+@router.callback_query(F.data.startswith("admin_manual_payment:"))
+async def admin_manual_payment_callback(query: CallbackQuery, state: FSMContext):
+    """Start manual payment flow."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    user_id = int(query.data.split(":")[1])
+    await state.update_data(payment_user_id=user_id)
+    await state.set_state(AdminStates.payment_amount)
+
+    await query.message.edit_text(
+        f"💸 Введите сумму выплаты (мин: {PAYMENT_MIN}, макс: {PAYMENT_MAX}):",
+        parse_mode="Markdown"
     )
-    await callback.answer()
+    await query.answer()
 
 
-@router.callback_query(F.data.startswith("adm_markpaid_"))
-async def cb_mark_paid(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    payment_id = int(callback.data.replace("adm_markpaid_", ""))
-    await db.mark_payment_paid(payment_id)
-    await callback.message.answer(f"✅ Платёж #{payment_id} отмечен как выплаченный.")
-    await callback.answer()
-
-
-# ─── Статистика ──────────────────────────────────────────────
-@router.callback_query(F.data == "adm_stats")
-async def cb_stats(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+@router.message(AdminStates.payment_amount)
+async def payment_amount_handler(message: Message, state: FSMContext):
+    """Handle payment amount input."""
+    if message.from_user.id not in ADMIN_IDS:
         return
 
-    stats = await db.get_stats()
-    bs = stats["by_status"]
+    try:
+        amount = float(message.text)
+        if amount < PAYMENT_MIN or amount > PAYMENT_MAX:
+            await message.answer(f"❌ Сумма должна быть от {PAYMENT_MIN} до {PAYMENT_MAX}")
+            return
 
-    # Конверсия
-    total = stats["total_referrals"]
-    conv_consult = f"{bs['consultation'] / total * 100:.0f}%" if total else "—"
-    conv_contract = f"{bs['contract'] / total * 100:.0f}%" if total else "—"
-    conv_enrolled = f"{bs['enrolled'] / total * 100:.0f}%" if total else "—"
+        await state.update_data(payment_amount=amount)
+        await state.set_state(AdminStates.payment_reason)
+        await message.answer("📝 Введите причину выплаты:")
 
-    text = (
-        f"📊 <b>Статистика</b>\n\n"
-        f"📋 Всего заявок: <b>{total}</b>\n"
-        f"  • Новые: {bs['new']}\n"
-        f"  • Консультация: {bs['consultation']}\n"
-        f"  • Договор: {bs['contract']}\n"
-        f"  • Учится: {bs['enrolled']}\n\n"
-        f"📈 Конверсия:\n"
-        f"  Заявка → Консультация: {conv_consult}\n"
-        f"  Заявка → Договор: {conv_contract}\n"
-        f"  Заявка → Учится: {conv_enrolled}\n\n"
-        f"💰 Начислено всего: <b>{stats['total_earned']} ₽</b>\n"
-        f"💸 Выплачено: {stats['total_paid']} ₽\n"
-        f"⏳ К выплате: {stats['total_earned'] - stats['total_paid']} ₽"
-    )
-
-    # ТОП-3 группы
-    top_groups = await db.leaderboard_groups(3)
-    if top_groups:
-        text += "\n\n🏆 ТОП-3 группы:"
-        for i, g in enumerate(top_groups, 1):
-            text += f"\n  {i}. {g['group_name']} — {g['cnt']}"
-
-    top_students = await db.leaderboard_students(3)
-    if top_students:
-        text += "\n\n👤 ТОП-3 студента:"
-        for i, s in enumerate(top_students, 1):
-            text += f"\n  {i}. {s['full_name']} — {s['cnt']}"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")]
-    ])
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
-    await callback.answer()
+    except ValueError:
+        await message.answer("❌ Введите корректное число")
 
 
-# ─── Выгрузка Excel ──────────────────────────────────────────
-@router.callback_query(F.data == "adm_export")
-async def cb_export(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    referrals = await db.get_all_referrals()
-    payments = await db.get_all_payments()
-
-    buf = await export_full_report(referrals, payments)
-    file = BufferedInputFile(buf.read(), filename="ithub_referrals_report.xlsx")
-
-    await callback.message.answer_document(
-        document=file,
-        caption="📥 Отчёт по реферальной программе",
-    )
-    await callback.answer()
-
-
-# ─── Рассылка ────────────────────────────────────────────────
-@router.callback_query(F.data == "adm_broadcast")
-async def cb_broadcast(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👨‍🎓 Всем студентам", callback_data="adm_bc_students")],
-        [InlineKeyboardButton(text="👨‍🏫 Всем кураторам", callback_data="adm_bc_curators")],
-        [InlineKeyboardButton(text="📋 Всем абитуриентам", callback_data="adm_bc_applicants")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")],
-    ])
-    await callback.message.answer("📢 Кому отправить рассылку?", reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("adm_bc_"))
-async def cb_broadcast_target(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-
-    target = callback.data.replace("adm_bc_", "")
-    await state.update_data(broadcast_target=target)
-    await state.set_state(AdminStates.broadcast_text)
-    await callback.message.answer(
-        "✏️ Введите текст рассылки (поддерживается HTML-разметка):"
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.broadcast_text)
-async def process_broadcast(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id):
+@router.message(AdminStates.payment_reason)
+async def payment_reason_handler(message: Message, state: FSMContext):
+    """Handle payment reason and create payment."""
+    if message.from_user.id not in ADMIN_IDS:
         return
 
     data = await state.get_data()
-    target = data["broadcast_target"]
-    text = message.text
+    user_id = data['payment_user_id']
+    amount = data['payment_amount']
+    reason = message.text
+
+    db = await get_db()
+
+    try:
+        # Create payment
+        await db.execute(
+            """
+            INSERT INTO payments (user_id, amount, reason, status, created_at)
+            VALUES (?, ?, ?, 'completed', ?)
+            """,
+            [user_id, amount, reason, datetime.now().isoformat()]
+        )
+        await db.commit()
+
+        student = await get_student_by_id(db, user_id)
+
+        # Notify student
+        await notify_student(user_id, f"💰 Вам выплачено: {amount}₽\nПричина: {reason}")
+
+        # Notify admin
+        await notify_admin(f"✅ Выплата {student['name']}: {amount}₽\nПричина: {reason}")
+
+        await message.answer(f"✅ Выплата {amount}₽ выполнена для {student['name']}")
+
+    finally:
+        await db.close()
 
     await state.clear()
 
-    sent = 0
-    failed = 0
 
-    if target == "students":
-        recipients = await db.get_students_with_telegram()
-        for s in recipients:
+@router.callback_query(F.data == "admin_payments")
+async def admin_payments_callback(query: CallbackQuery):
+    """Show payment registry."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    db = await get_db()
+
+    try:
+        payments = await db.fetchall(
+            """
+            SELECT p.*, s.name FROM payments p
+            JOIN students s ON p.user_id = s.user_id
+            ORDER BY p.created_at DESC
+            LIMIT 50
+            """
+        )
+
+        text = "💰 *Реестр платежей (последние 50)*\n\n"
+
+        total = 0
+        for p in payments:
+            total += p['amount']
+            status_emoji = "✅" if p['status'] == "completed" else "⏳"
+            text += f"{status_emoji} {p['name']}: {p['amount']}₽ ({p['reason']})\n"
+
+        text += f"\n*Всего: {total}₽*"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_menu")],
+        ])
+
+        await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+    finally:
+        await db.close()
+
+    await query.answer()
+
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats_callback(query: CallbackQuery):
+    """Show statistics dashboard."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    db = await get_db()
+
+    try:
+        # Get stats
+        total_students = await db.fetchval("SELECT COUNT(*) FROM students")
+        total_referrals = await db.fetchval("SELECT COUNT(*) FROM referrals")
+        total_payments = await db.fetchval("SELECT SUM(amount) FROM payments WHERE status = 'completed'") or 0
+
+        # Count by status
+        status_counts = await db.fetchall(
+            "SELECT status, COUNT(*) as count FROM students GROUP BY status"
+        )
+
+        text = "📊 *Статистика*\n\n"
+        text += f"👥 Студентов: *{total_students}*\n"
+        text += f"🔗 Рефералов: *{total_referrals}*\n"
+        text += f"💰 Выплачено: *{total_payments}₽*\n\n"
+
+        text += "*По статусам:*\n"
+        for sc in status_counts:
+            emoji = STATUS_EMOJI.get(sc['status'], '•')
+            text += f"{emoji} {sc['status']}: {sc['count']}\n"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_menu")],
+        ])
+
+        await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+    finally:
+        await db.close()
+
+    await query.answer()
+
+
+@router.callback_query(F.data == "admin_export")
+async def admin_export_callback(query: CallbackQuery):
+    """Export data to Excel."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    db = await get_db()
+
+    try:
+        # Generate Excel report
+        xlsx_data = await export_full_report(db)
+
+        # Send as document
+        await query.message.answer_document(
+            document=xlsx_data,
+            caption="📥 Полный отчет"
+        )
+        await query.answer("✅ Экспорт завершен")
+
+    finally:
+        await db.close()
+
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_callback(query: CallbackQuery, state: FSMContext):
+    """Start broadcast flow."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.broadcast_message)
+    await query.message.edit_text(
+        "📢 Введите сообщение для рассылки всем студентам:"
+    )
+    await query.answer()
+
+
+@router.message(AdminStates.broadcast_message)
+async def broadcast_message_handler(message: Message, state: FSMContext):
+    """Send broadcast to all students."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    db = await get_db()
+
+    try:
+        students = await db.fetchall("SELECT user_id FROM students")
+
+        sent = 0
+        for student in students:
             try:
-                await bot.send_message(s["telegram_id"], text, parse_mode="HTML")
+                await notify_student(student['user_id'], message.text)
                 sent += 1
             except Exception:
-                failed += 1
+                pass
 
-    elif target == "curators":
-        curators = await db.get_curators()
-        for c in curators:
-            if c.get("telegram_id"):
-                try:
-                    await bot.send_message(c["telegram_id"], text, parse_mode="HTML")
-                    sent += 1
-                except Exception:
-                    failed += 1
+        await message.answer(f"✅ Рассылка отправлена {sent} студентам")
 
-    elif target == "applicants":
-        # У абитуриентов может быть telegram_id
-        all_refs = await db.get_all_referrals()
-        for r in all_refs:
-            if r.get("telegram_id"):
-                try:
-                    await bot.send_message(r["telegram_id"], text, parse_mode="HTML")
-                    sent += 1
-                except Exception:
-                    failed += 1
+    finally:
+        await db.close()
 
-    await message.answer(
-        f"📢 Рассылка завершена.\n"
-        f"✅ Отправлено: {sent}\n"
-        f"❌ Ошибок: {failed}"
-    )
+    await state.clear()
 
 
-# ─── Добавление студента ────────────────────────────────────
-@router.callback_query(F.data == "adm_add_student")
-async def cb_add_student(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
+@router.callback_query(F.data == "admin_add_student")
+async def admin_add_student_callback(query: CallbackQuery, state: FSMContext):
+    """Start add student flow."""
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("❌ Доступ запрещен", show_alert=True)
         return
+
     await state.set_state(AdminStates.add_student_name)
-    await callback.message.answer("Введите <b>ФИО</b> нового студента:", parse_mode="HTML")
-    await callback.answer()
+    await query.message.edit_text("👤 Введите имя студента:")
+    await query.answer()
 
 
 @router.message(AdminStates.add_student_name)
-async def process_add_name(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+async def add_student_name_handler(message: Message, state: FSMContext):
+    """Handle student name."""
+    if message.from_user.id not in ADMIN_IDS:
         return
-    await state.update_data(new_student_name=message.text.strip())
+
+    await state.update_data(add_name=message.text)
     await state.set_state(AdminStates.add_student_group)
-    await message.answer("Введите <b>группу</b>:", parse_mode="HTML")
+    await message.answer("📚 Введите группу:")
 
 
 @router.message(AdminStates.add_student_group)
-async def process_add_group(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    await state.update_data(new_student_group=message.text.strip())
-    await state.set_state(AdminStates.add_student_role)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Студент", callback_data="adm_role_student")],
-        [InlineKeyboardButton(text="Куратор", callback_data="adm_role_curator")],
-    ])
-    await message.answer("Выберите роль:", reply_markup=kb)
-
-
-@router.callback_query(AdminStates.add_student_role, F.data.startswith("adm_role_"))
-async def process_add_role(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
+async def add_student_group_handler(message: Message, state: FSMContext):
+    """Handle student group."""
+    if message.from_user.id not in ADMIN_IDS:
         return
 
-    role = callback.data.replace("adm_role_", "")
+    await state.update_data(add_group=message.text)
+    await state.set_state(AdminStates.add_student_email)
+    await message.answer("📧 Введите email:")
+
+
+@router.message(AdminStates.add_student_email)
+async def add_student_email_handler(message: Message, state: FSMContext):
+    """Handle student email and create account."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
     data = await state.get_data()
+
+    db = await get_db()
+
+    try:
+        # Check if email exists
+        existing = await db.fetchone("SELECT * FROM students WHERE email = ?", [message.text])
+        if existing:
+            await message.answer("❌ Студент с таким email уже существует")
+            return
+
+        # Create new student
+        import uuid
+        new_user_id = int(uuid.uuid4().int % 1000000000)
+
+        await db.execute(
+            """
+            INSERT INTO students (user_id, name, group, email, status, created_at)
+            VALUES (?, ?, ?, ?, '📋 заявка', ?)
+            """,
+            [new_user_id, data['add_name'], data['add_group'], message.text, datetime.now().isoformat()]
+        )
+        await db.commit()
+
+        await message.answer(
+            f"✅ Студент добавлен\n"
+            f"ID: `{new_user_id}`\n"
+            f"Имя: {data['add_name']}\n"
+            f"Группа: {data['add_group']}\n"
+            f"Email: {message.text}",
+            parse_mode="Markdown"
+        )
+
+        # Notify admin
+        await notify_admin(f"➕ Добавлен новый студент: {data['add_name']}")
+
+    finally:
+        await db.close()
+
     await state.clear()
-
-    student = await db.add_student(
-        full_name=data["new_student_name"],
-        group_name=data["new_student_group"],
-        role=role,
-    )
-
-    await callback.message.answer(
-        f"✅ Добавлен: <b>{student['full_name']}</b>\n"
-        f"Группа: {student['group_name']}\n"
-        f"Роль: {role}\n"
-        f"Реф-код: <code>{student['ref_code']}</code>",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-# ─── Назад в админ-меню ─────────────────────────────────────
-@router.callback_query(F.data == "adm_back")
-async def cb_admin_back(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    await callback.message.answer(
-        "🔧 <b>Админ-панель</b>",
-        parse_mode="HTML",
-        reply_markup=ADMIN_MENU_KB,
-    )
-    await callback.answer()

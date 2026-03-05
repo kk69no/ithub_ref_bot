@@ -18,7 +18,6 @@ from utils.notifications import (
 router = Router()
 
 
-# ─── FSM заявки абитуриента ─────────────────────────────────
 class ApplicantForm(StatesGroup):
     waiting_name = State()
     waiting_phone = State()
@@ -40,85 +39,74 @@ GRADE_KB = InlineKeyboardMarkup(inline_keyboard=[
 
 
 def normalize_phone(phone: str) -> str:
-    """Убрать всё кроме цифр и +."""
     return re.sub(r"[^\d+]", "", phone)
 
 
 def validate_phone(phone: str) -> bool:
-    """Валидация формата телефона."""
     clean = normalize_phone(phone)
     return bool(re.match(r"^\+?\d{10,15}$", clean))
 
 
-# ─── Шаг 1: Имя (state ставится из student.py deep link) ────
 @router.message(ApplicantForm.waiting_name)
 async def process_applicant_name(message: Message, state: FSMContext):
     name = message.text.strip()
     if len(name) < 2:
-        await message.answer("Пожалуйста, введи своё имя и фамилию:")
+        await message.answer("✏️ Пожалуйста, введи своё имя и фамилию:")
         return
-
     await state.update_data(applicant_name=name)
     await state.set_state(ApplicantForm.waiting_phone)
     await message.answer(
-        "📞 Введи свой <b>номер телефона</b>:\n"
-        "(например: +79281234567)",
+        "📞 Отлично! Теперь введи <b>номер телефона</b>:\n"
+        "<i>Например: +79281234567</i>",
         parse_mode="HTML",
     )
 
 
-# ─── Шаг 2: Телефон ─────────────────────────────────────────
 @router.message(ApplicantForm.waiting_phone)
 async def process_applicant_phone(message: Message, state: FSMContext):
     phone = normalize_phone(message.text.strip())
-
     if not validate_phone(phone):
         await message.answer(
-            "❌ Неверный формат телефона. Введи номер в формате +79281234567:"
+            "❌ Неверный формат. Введи номер так: <b>+79281234567</b>",
+            parse_mode="HTML",
         )
         return
 
-    # Защита от дублей
     existing = await db.get_referral_by_phone(phone)
     if existing:
-        await message.answer("⚠️ Ты уже оставлял заявку! Мы свяжемся с тобой.")
+        await message.answer(
+            "😊 Ты уже оставлял заявку! Мы свяжемся с тобой в ближайшее время."
+        )
         await state.clear()
         return
 
     await state.update_data(applicant_phone=phone)
     await state.set_state(ApplicantForm.waiting_grade)
-    await message.answer(
-        "🎓 В каком ты классе?",
-        reply_markup=GRADE_KB,
-    )
+    await message.answer("🎓 В каком ты классе?", reply_markup=GRADE_KB)
 
 
-# ─── Шаг 3: Класс (inline-кнопки) ──────────────────────────
 @router.callback_query(ApplicantForm.waiting_grade, F.data.startswith("grade_"))
 async def process_applicant_grade(callback: CallbackQuery, state: FSMContext):
     grade_map = {
-        "grade_8": "8",
-        "grade_9": "9",
-        "grade_10": "10",
-        "grade_11": "11",
+        "grade_8": "8", "grade_9": "9",
+        "grade_10": "10", "grade_11": "11",
         "grade_other": "другое",
     }
     grade = grade_map.get(callback.data, "другое")
     await state.update_data(applicant_grade=grade)
     await state.set_state(ApplicantForm.waiting_school)
     await callback.message.answer(
-        "🏫 Напиши <b>название школы</b> и <b>населённый пункт</b>:",
+        "🏫 Напиши <b>название школы</b> и <b>город/село</b>:",
         parse_mode="HTML",
     )
     await callback.answer()
 
 
-# ─── Шаг 4: Школа → сохранение заявки ───────────────────────
 @router.message(ApplicantForm.waiting_school)
 async def process_applicant_school(message: Message, state: FSMContext, bot: Bot):
     school = message.text.strip()
     if len(school) < 2:
-        await message.answer("Пожалуйста, напиши название школы и город:")
+        await message.answer("✏️ Напиши название школы и населённый пункт:")
         return
 
     data = await state.get_data()
@@ -127,7 +115,6 @@ async def process_applicant_school(message: Message, state: FSMContext, bot: Bot
     phone = data["applicant_phone"]
     grade = data["applicant_grade"]
 
-    # Защита: студент не может отправить заявку сам на себя
     if referrer_id:
         referrer = await db.get_student_by_id(referrer_id)
         if referrer and referrer.get("telegram_id") == message.from_user.id:
@@ -135,14 +122,12 @@ async def process_applicant_school(message: Message, state: FSMContext, bot: Bot
             await state.clear()
             return
 
-    # Повторная проверка дубля (на случай race condition)
     existing = await db.get_referral_by_phone(phone)
     if existing:
-        await message.answer("⚠️ Заявка с таким номером уже существует!")
+        await message.answer("😊 Заявка с таким номером уже существует!")
         await state.clear()
         return
 
-    # Сохраняем заявку
     referral = await db.add_referral(
         referrer_id=referrer_id,
         full_name=applicant_name,
@@ -151,32 +136,23 @@ async def process_applicant_school(message: Message, state: FSMContext, bot: Bot
         school=school,
         telegram_id=message.from_user.id,
     )
-
     await state.clear()
 
     await message.answer(
-        "✅ <b>Спасибо!</b> Твоя заявка принята.\n"
-        "Мы свяжемся с тобой в ближайшее время! 📞",
+        "✅ <b>Спасибо, заявка принята!</b>\n\n"
+        "📞 Мы свяжемся с тобой в ближайшее время.\n"
+        "Следи за обновлениями здесь — бот сообщит о ходе рассмотрения!",
         parse_mode="HTML",
     )
 
-    # ─── Уведомления ─────────────────────────────────
     if referrer_id:
         referrer = await db.get_student_by_id(referrer_id)
         if referrer:
-            # Уведомляем админов
             await notify_new_referral(bot, referral, referrer)
-
-            # Уведомляем студента-реферера
             if referrer.get("telegram_id"):
-                await notify_student_new_referral(
-                    bot, referrer["telegram_id"], applicant_name
-                )
-
-            # Уведомляем куратора группы
+                await notify_student_new_referral(bot, referrer["telegram_id"], applicant_name)
             curator = await db.get_curator_for_group(referrer["group_name"])
             if curator and curator.get("telegram_id"):
                 await notify_curator_new_referral(
-                    bot, curator["telegram_id"],
-                    referrer["full_name"], applicant_name,
+                    bot, curator["telegram_id"], referrer["full_name"], applicant_name
                 )

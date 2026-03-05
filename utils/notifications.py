@@ -1,111 +1,191 @@
-"""
-Система уведомлений — отправка сообщений админам, студентам, кураторам.
-"""
-import logging
-from aiogram import Bot
+"""Notification utilities for admins, students, and curators."""
 
 from config import ADMIN_IDS, ADMIN_NOTIFY_CHAT_ID, STATUSES
 
-logger = logging.getLogger(__name__)
+
+async def notify_admin(message: str, bot=None) -> bool:
+    """Send notification to admin chat.
+
+    Args:
+        message: Message text
+        bot: Aiogram bot instance
+
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    if not bot or not ADMIN_NOTIFY_CHAT_ID:
+        return False
+
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_NOTIFY_CHAT_ID,
+            text=message,
+            parse_mode="Markdown"
+        )
+        return True
+    except Exception:
+        return False
 
 
-async def notify_admins(bot: Bot, text: str):
-    """Отправить сообщение в чат админов или каждому админу лично."""
-    if ADMIN_NOTIFY_CHAT_ID:
-        try:
-            await bot.send_message(ADMIN_NOTIFY_CHAT_ID, text)
-            return
-        except Exception as e:
-            logger.warning(f"Не удалось отправить в чат админов: {e}")
+async def notify_admins_list(message: str, bot=None) -> int:
+    """Send notification to all admins in list.
 
+    Args:
+        message: Message text
+        bot: Aiogram bot instance
+
+    Returns:
+        Number of admins notified
+    """
+    if not bot or not ADMIN_IDS:
+        return 0
+
+    sent = 0
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, text)
-        except Exception as e:
-            logger.warning(f"Не удалось отправить админу {admin_id}: {e}")
+            await bot.send_message(
+                chat_id=admin_id,
+                text=message,
+                parse_mode="Markdown"
+            )
+            sent += 1
+        except Exception:
+            pass
+
+    return sent
 
 
-async def notify_new_referral(bot: Bot, referral: dict, referrer: dict):
-    """Уведомить админов о новой заявке."""
-    text = (
-        f"📋 <b>Новая заявка</b>\n\n"
-        f"👤 {referral['full_name']}\n"
-        f"📞 {referral['phone']}\n"
-        f"🎓 Класс: {referral.get('grade', '—')}\n"
-        f"🏫 Школа: {referral.get('school', '—')}\n\n"
-        f"Привёл: <b>{referrer['full_name']}</b> из группы {referrer['group_name']}"
+async def notify_student(user_id: int, message: str, bot=None) -> bool:
+    """Send notification to student.
+
+    Args:
+        user_id: Student user ID
+        message: Message text
+        bot: Aiogram bot instance
+
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    if not bot:
+        return False
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=message,
+            parse_mode="Markdown"
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def notify_curator(user_id: int, message: str, bot=None) -> bool:
+    """Send notification to curator.
+
+    Args:
+        user_id: Curator user ID
+        message: Message text
+        bot: Aiogram bot instance
+
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    if not bot:
+        return False
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=message,
+            parse_mode="Markdown"
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def notify_group(group_id: int, message: str, db=None, bot=None) -> int:
+    """Send notification to all students in group.
+
+    Args:
+        group_id: Group ID
+        message: Message text
+        db: Database connection
+        bot: Aiogram bot instance
+
+    Returns:
+        Number of students notified
+    """
+    if not db or not bot:
+        return 0
+
+    students = await db.fetchall(
+        "SELECT user_id FROM students WHERE group = ?",
+        [group_id]
     )
-    await notify_admins(bot, text)
+
+    sent = 0
+    for student in students:
+        try:
+            await bot.send_message(
+                chat_id=student['user_id'],
+                text=message,
+                parse_mode="Markdown"
+            )
+            sent += 1
+        except Exception:
+            pass
+
+    return sent
 
 
-async def notify_student_new_referral(bot: Bot, student_telegram_id: int, referral_name: str):
-    """Уведомить студента, что его друг оставил заявку."""
-    try:
-        await bot.send_message(
-            student_telegram_id,
-            f"🎉 Твой друг <b>{referral_name}</b> оставил заявку! "
-            f"Мы свяжемся с ним. Спасибо!",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.warning(f"Не удалось уведомить студента {student_telegram_id}: {e}")
+async def notify_status_change(user_id: int, old_status: str, new_status: str, bot=None) -> bool:
+    """Send status change notification.
+
+    Args:
+        user_id: User ID
+        old_status: Previous status
+        new_status: New status
+        bot: Aiogram bot instance
+
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    message = f"📝 Ваш статус изменен:\n`{old_status}` → `{new_status}`"
+    return await notify_student(user_id, message, bot)
 
 
-async def notify_student_status_change(bot: Bot, student_telegram_id: int,
-                                       referral_name: str, new_status: str, amount: int):
-    """Уведомить студента об изменении статуса его реферала."""
-    status_label = STATUSES.get(new_status, new_status)
-    if new_status == "contract":
-        text = (
-            f"🎉 Отличная новость! <b>{referral_name}</b> подписал договор.\n"
-            f"Тебе начислено <b>{amount} ₽</b>!"
-        )
-    elif new_status == "enrolled":
-        text = (
-            f"🎓 <b>{referral_name}</b> начал учиться в IThub!\n"
-            f"Тебе начислено ещё <b>{amount} ₽</b>."
-        )
-    else:
-        text = (
-            f"ℹ️ Статус <b>{referral_name}</b> изменён на «{status_label}»."
-        )
-    try:
-        await bot.send_message(student_telegram_id, text, parse_mode="HTML")
-    except Exception as e:
-        logger.warning(f"Не удалось уведомить студента: {e}")
+async def notify_payment(user_id: int, amount: float, reason: str = None, bot=None) -> bool:
+    """Send payment notification.
+
+    Args:
+        user_id: User ID
+        amount: Payment amount
+        reason: Optional payment reason
+        bot: Aiogram bot instance
+
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    message = f"💰 Вам выполнена выплата на сумму *{amount}₽*"
+
+    if reason:
+        message += f"\n\nПричина: {reason}"
+
+    return await notify_student(user_id, message, bot)
 
 
-async def notify_curator_new_referral(bot: Bot, curator_telegram_id: int,
-                                      student_name: str, referral_name: str):
-    """Уведомить куратора о новом реферале из его группы."""
-    try:
-        await bot.send_message(
-            curator_telegram_id,
-            f"👥 Студент <b>{student_name}</b> из вашей группы привёл "
-            f"абитуриента <b>{referral_name}</b>. Статус: заявка.",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.warning(f"Не удалось уведомить куратора: {e}")
+async def notify_referral_status(student_id: int, new_status: str, bot=None) -> bool:
+    """Send referral status change notification.
 
+    Args:
+        student_id: Student ID
+        new_status: New status
+        bot: Aiogram bot instance
 
-async def notify_curator_status_change(bot: Bot, curator_telegram_id: int,
-                                       student_name: str, referral_name: str,
-                                       new_status: str, amount: int):
-    """Уведомить куратора об изменении статуса."""
-    if new_status == "contract":
-        text = (
-            f"📝 Абитуриент <b>{referral_name}</b> (привёл {student_name}) "
-            f"подписал договор. Вам начислено <b>{amount} ₽</b>."
-        )
-    elif new_status == "enrolled":
-        text = (
-            f"🎓 <b>{referral_name}</b> начал учиться. "
-            f"Вам начислено ещё <b>{amount} ₽</b>."
-        )
-    else:
-        return  # куратора уведомляем только при contract / enrolled
-    try:
-        await bot.send_message(curator_telegram_id, text, parse_mode="HTML")
-    except Exception as e:
-        logger.warning(f"Не удалось уведомить куратора: {e}")
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    message = f"🔗 Ваш реферал обновлен: *{new_status}*"
+    return await notify_student(student_id, message, bot)

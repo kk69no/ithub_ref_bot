@@ -1,105 +1,131 @@
 #!/bin/bash
-# ═══════════════════════════════════════════════════════════════
-#  ПЕРВЫЙ ДЕПЛОЙ — запускать один раз на новом VPS
-#
-#  Клонирует репо с GitHub, ставит зависимости, создаёт сервис.
-#
-#  Использование:
-#    sudo bash deploy.sh https://github.com/YOUR_USER/ithub-ref-bot.git
-# ═══════════════════════════════════════════════════════════════
-
 set -e
 
-REPO_URL="${1:?Укажите URL репозитория: sudo bash deploy.sh https://github.com/USER/REPO.git}"
-APP_DIR="/opt/ithub_ref_bot"
-APP_USER="ithub_bot"
+# Deploy script for ithub_ref_bot
+# Usage: ./deploy.sh <github_repo_url>
+
+REPO_URL="${1:-https://github.com/yourusername/ithub_ref_bot.git}"
+INSTALL_DIR="/opt/ithub_ref_bot"
 SERVICE_NAME="ithub-ref-bot"
+WEBHOOK_PORT="${WEBHOOK_PORT:-8443}"
 
-echo "══════════════════════════════════════════"
-echo "  Первый деплой IThub Referral Bot"
-echo "  Репозиторий: $REPO_URL"
-echo "══════════════════════════════════════════"
-
-# ─── 1. Системные пакеты ────────────────────────────────────
+echo "================================================"
+echo "ithub_ref_bot Deployment Script"
+echo "================================================"
 echo ""
-echo "[1/6] Установка системных пакетов..."
-apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip git > /dev/null
+echo "Repository: $REPO_URL"
+echo "Install directory: $INSTALL_DIR"
+echo "Service name: $SERVICE_NAME"
+echo "Webhook port: $WEBHOOK_PORT"
+echo ""
 
-# ─── 2. Пользователь ────────────────────────────────────────
-echo "[2/6] Создание пользователя $APP_USER..."
-if ! id "$APP_USER" &>/dev/null; then
-    useradd --system --no-create-home --shell /bin/false "$APP_USER"
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+    echo "❌ This script must be run as root"
+    exit 1
 fi
 
-# ─── 3. Клонировать репо ────────────────────────────────────
-echo "[3/6] Клонирование из GitHub..."
-if [ -d "$APP_DIR/.git" ]; then
-    echo "  Репо уже склонировано, обновляю..."
-    cd "$APP_DIR"
+# Create installation directory
+echo "📁 Creating installation directory..."
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+# Clone or update repository
+if [ -d .git ]; then
+    echo "📦 Updating existing repository..."
     git pull origin main
 else
-    rm -rf "$APP_DIR"
-    git clone "$REPO_URL" "$APP_DIR"
+    echo "📦 Cloning repository..."
+    git clone "$REPO_URL" .
 fi
 
-# ─── 4. Python venv + зависимости ───────────────────────────
-echo "[4/6] Установка Python-зависимостей..."
-cd "$APP_DIR"
-python3 -m venv venv
-venv/bin/pip install --upgrade pip -q
-venv/bin/pip install -r requirements.txt -q
-
-# ─── 5. Конфигурация .env ───────────────────────────────────
-echo "[5/6] Настройка .env..."
-if [ ! -f "$APP_DIR/.env" ]; then
-    cp "$APP_DIR/.env.example" "$APP_DIR/.env"
-    echo ""
-    echo "  ⚠️  ВАЖНО! Заполните конфиг:"
-    echo "     nano $APP_DIR/.env"
-    echo ""
+# Create Python virtual environment
+echo "🐍 Setting up Python virtual environment..."
+if [ ! -d venv ]; then
+    python3 -m venv venv
 fi
 
-# ─── 6. Systemd-сервис ─────────────────────────────────────
-echo "[6/6] Создание systemd-сервиса..."
+# Activate virtual environment and install dependencies
+echo "📥 Installing dependencies..."
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# Create data directory
+echo "📂 Creating data directory..."
+mkdir -p data
+
+# Copy .env.example to .env if not exists
+if [ ! -f .env ]; then
+    echo "⚙️  Copying .env.example to .env..."
+    cp .env.example .env
+    echo "⚠️  Please edit .env and set your configuration!"
+    echo "   BOT_TOKEN, ADMIN_IDS, and other settings"
+fi
+
+# Create systemd service
+echo "🔧 Creating systemd service..."
 cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
 [Unit]
-Description=IThub Nalchik Referral Telegram Bot
+Description=ithub_ref_bot Telegram Bot
 After=network.target
 
 [Service]
 Type=simple
-User=$APP_USER
-Group=$APP_USER
-WorkingDirectory=$APP_DIR
-EnvironmentFile=$APP_DIR/.env
-ExecStart=$APP_DIR/venv/bin/python main.py
+User=nobody
+WorkingDirectory=$INSTALL_DIR
+Environment="PATH=$INSTALL_DIR/venv/bin"
+ExecStart=$INSTALL_DIR/venv/bin/python main.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=$SERVICE_NAME
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
+# Reload systemd
 systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
+
+# Enable service
+systemctl enable ${SERVICE_NAME}
 
 echo ""
-echo "══════════════════════════════════════════"
-echo "  ✅ Деплой завершён!"
-echo "══════════════════════════════════════════"
+echo "================================================"
+echo "✅ Deployment Complete!"
+echo "================================================"
 echo ""
-echo "  Дальше:"
-echo "  1. Заполнить .env:       nano $APP_DIR/.env"
-echo "  2. Загрузить студентов:  sudo -u $APP_USER $APP_DIR/venv/bin/python $APP_DIR/load_students.py /path/to/students.csv"
-echo "  3. Запустить бота:       sudo systemctl start $SERVICE_NAME"
-echo "  4. Проверить:            sudo systemctl status $SERVICE_NAME"
-echo "  5. Логи:                 sudo journalctl -u $SERVICE_NAME -f"
+echo "Next steps:"
+echo "1. Edit the configuration file:"
+echo "   nano $INSTALL_DIR/.env"
 echo ""
-echo "  После изменения кода — пуш на GitHub, потом на сервере:"
-echo "     sudo $APP_DIR/update.sh"
+echo "2. Start the service:"
+echo "   systemctl start $SERVICE_NAME"
+echo ""
+echo "3. Check service status:"
+echo "   systemctl status $SERVICE_NAME"
+echo ""
+echo "4. View logs:"
+echo "   journalctl -u $SERVICE_NAME -f"
+echo ""
+
+# Firewall configuration
+if command -v ufw &> /dev/null; then
+    echo "🔒 Configuring firewall..."
+    ufw allow "$WEBHOOK_PORT/tcp" || true
+    echo "✅ Firewall port $WEBHOOK_PORT opened"
+elif command -v firewall-cmd &> /dev/null; then
+    echo "🔒 Configuring firewall..."
+    firewall-cmd --permanent --add-port="$WEBHOOK_PORT/tcp" || true
+    firewall-cmd --reload || true
+    echo "✅ Firewall port $WEBHOOK_PORT opened"
+else
+    echo "⚠️  No firewall management tool found"
+    echo "   Manually open port $WEBHOOK_PORT if needed"
+fi
+
+echo ""
+echo "Deployment directory: $INSTALL_DIR"
+echo "Service: $SERVICE_NAME"
 echo ""

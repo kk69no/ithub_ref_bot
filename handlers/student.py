@@ -1,17 +1,19 @@
 """
 Хендлеры модуля студента:
-- /start (регистрация)
+- /start с OAuth через newlxp
 - Главное меню: ссылка, рефералы, баланс, лидерборд, правила
+- /help
 """
-import re
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, BufferedInputFile
-from aiogram.filters import CommandStart, CommandObject
+from aiogram.types import (
+    Message, CallbackQuery, BufferedInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 
 import database as db
-from config import STATUSES, ADMIN_IDS
+from config import ADMIN_IDS, STATUSES, STATUS_EMOJI, NEWLXP_AUTH_URL
 from utils.qr_generator import generate_qr
 from handlers.leaderboard import build_leaderboard_text
 from handlers.applicant import ApplicantForm
@@ -19,14 +21,7 @@ from handlers.applicant import ApplicantForm
 router = Router()
 
 
-# ─── FSM для регистрации ────────────────────────────────────
-class Registration(StatesGroup):
-    waiting_full_name = State()
-    waiting_group = State()
-
-
-# ─── Inline-клавиатура главного меню ────────────────────────
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+# ─── Клавиатуры ─────────────────────────────────────────────
 
 def main_menu_kb(is_curator: bool = False) -> InlineKeyboardMarkup:
     buttons = [
@@ -35,122 +30,198 @@ def main_menu_kb(is_curator: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💰 Мой баланс", callback_data="my_balance")],
         [InlineKeyboardButton(text="🏆 Лидерборд", callback_data="leaderboard")],
         [InlineKeyboardButton(text="❓ Правила", callback_data="rules")],
+        [InlineKeyboardButton(text="💬 Помощь", callback_data="help")],
     ]
     if is_curator:
         buttons.insert(2, [
-            InlineKeyboardButton(text="👥 Рефералы группы", callback_data="group_referrals"),
-            InlineKeyboardButton(text="💰 Баланс куратора", callback_data="curator_balance"),
+            InlineKeyboardButton(text="👥 Группа", callback_data="group_referrals"),
+            InlineKeyboardButton(text="💰 Куратор", callback_data="curator_balance"),
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# ─── /start ─────────────────────────────────────────────────
+# ─── /start с deep link (абитуриент) ────────────────────────
 @router.message(CommandStart(deep_link=True))
 async def cmd_start_deep(message: Message, command: CommandObject, state: FSMContext):
-    """Переход по реферальной ссылке (абитуриент)."""
     ref_code = command.args
     if ref_code:
         referrer = await db.get_student_by_ref_code(ref_code)
         if referrer:
-            # Проверяем, не студент ли это сам
+            # Уже студент?
             existing = await db.get_student_by_telegram_id(message.from_user.id)
             if existing:
                 await message.answer(
-                    "Ты уже зарегистрирован как студент! Используй главное меню.",
+                    "😊 Ты уже зарегистрирован как студент!",
                 )
                 await show_main_menu(message, existing)
                 return
 
-            await state.update_data(referrer_id=referrer["id"], referrer_name=referrer["full_name"])
+            await state.update_data(referrer_id=referrer["id"])
             await state.set_state(ApplicantForm.waiting_name)
             await message.answer(
-                f"Привет! Тебя пригласил <b>{referrer['full_name']}</b> из IThub.\n"
-                f"Заполни заявку — мы свяжемся с тобой!\n\n"
+                f"👋 <b>Привет!</b>\n\n"
+                f"Тебя пригласил <b>{referrer['full_name']}</b> из IThub Нальчик.\n"
+                f"Заполни короткую заявку — мы свяжемся с тобой!\n\n"
                 f"Введи своё <b>имя и фамилию</b>:",
                 parse_mode="HTML",
             )
             return
 
-    # Если реф-код невалидный — обычный старт
     await cmd_start(message, state)
 
 
+# ─── /start (регистрация студента через newlxp OAuth) ───────
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    """Обычный /start — регистрация студента."""
     student = await db.get_student_by_telegram_id(message.from_user.id)
     if student:
         await show_main_menu(message, student)
         return
 
-    # Проверяем, не админ ли
     if message.from_user.id in ADMIN_IDS:
         await message.answer(
-            "👋 Добро пожаловать, админ! Используйте /admin для управления."
+            "👋 Добро пожаловать, админ!\n"
+            "Используй /admin для управления.",
         )
         return
 
-    await message.answer(
-        "👋 <b>Добро пожаловать в реферальную программу IThub!</b>\n\n"
-        "Для регистрации введи своё <b>ФИО</b> (как в списке колледжа):",
-        parse_mode="HTML",
-    )
-    await state.set_state(Registration.waiting_full_name)
-
-
-@router.message(Registration.waiting_full_name)
-async def process_full_name(message: Message, state: FSMContext):
-    await state.update_data(full_name=message.text.strip())
-    await message.answer("Теперь введи <b>номер/название своей группы</b>:", parse_mode="HTML")
-    await state.set_state(Registration.waiting_group)
-
-
-@router.message(Registration.waiting_group)
-async def process_group(message: Message, state: FSMContext):
-    data = await state.get_data()
-    full_name = data["full_name"]
-    group_name = message.text.strip()
-
-    # Пробуем найти в предзагруженной базе
-    student = await db.find_student_by_name_and_group(full_name, group_name)
-
-    if student:
-        if student["telegram_id"]:
+    # Проверяем, может есть верифицированный токен (вернулся после newlxp)
+    verified = await db.get_verified_token_for_user(message.from_user.id)
+    if verified:
+        student = await db.get_student_by_id(verified["student_id"])
+        if student and not student.get("telegram_id"):
+            await db.register_student_telegram(student["id"], message.from_user.id)
+            await db.mark_token_used(verified["token"])
+            student = await db.get_student_by_id(student["id"])
             await message.answer(
-                "⚠️ Этот студент уже зарегистрирован в боте. "
-                "Если это ошибка — обратитесь к куратору или Арсену."
+                f"🎉 <b>Добро пожаловать, {student['full_name']}!</b>\n\n"
+                f"📚 Группа: {student['group_name']}\n"
+                f"🔗 Твоя реферальная ссылка готова!\n\n"
+                f"Приглашай друзей и зарабатывай до <b>5 000 ₽</b> за каждого!",
+                parse_mode="HTML",
             )
-            await state.clear()
+            await show_main_menu(message, student)
             return
 
-        # Привязываем Telegram ID
-        await db.register_student_telegram(student["id"], message.from_user.id)
-        student = await db.get_student_by_id(student["id"])
-        await state.clear()
-        await message.answer(
-            f"✅ Отлично, <b>{student['full_name']}</b>! Ты зарегистрирован.\n"
-            f"Группа: {student['group_name']}\n\n"
-            f"Твоя реферальная ссылка готова! 👇",
+    # Генерируем токен и отправляем на newlxp
+    token = await db.create_auth_token(message.from_user.id)
+    auth_url = NEWLXP_AUTH_URL.format(token=token)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔑 Войти через newlxp", url=auth_url)],
+        [InlineKeyboardButton(text="🔄 Я авторизовался", callback_data="check_auth")],
+    ])
+
+    await message.answer(
+        "👋 <b>Добро пожаловать в реферальную программу IThub!</b>\n\n"
+        "Для регистрации нужно подтвердить личность через сайт колледжа.\n\n"
+        "1️⃣ Нажми кнопку <b>«Войти через newlxp»</b>\n"
+        "2️⃣ Авторизуйся на сайте\n"
+        "3️⃣ Вернись сюда и нажми <b>«Я авторизовался»</b>",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+# ─── Проверка OAuth-авторизации ─────────────────────────────
+@router.callback_query(F.data == "check_auth")
+async def cb_check_auth(callback: CallbackQuery):
+    verified = await db.get_verified_token_for_user(callback.from_user.id)
+
+    if not verified:
+        token = await db.create_auth_token(callback.from_user.id)
+        auth_url = NEWLXP_AUTH_URL.format(token=token)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔑 Войти через newlxp", url=auth_url)],
+            [InlineKeyboardButton(text="🔄 Я авторизовался", callback_data="check_auth")],
+        ])
+        await callback.message.answer(
+            "⏳ Авторизация ещё не завершена.\n\n"
+            "Нажми <b>«Войти через newlxp»</b>, авторизуйся на сайте, "
+            "а затем вернись и нажми <b>«Я авторизовался»</b>.",
             parse_mode="HTML",
+            reply_markup=kb,
         )
-        await show_main_menu(message, student)
-    else:
-        await message.answer(
-            "❌ Не нашли тебя в базе студентов.\n"
-            "Проверь правильность ФИО и группы. "
-            "Если проблема сохраняется — обратись к куратору или Арсену.\n\n"
-            "Попробуй ещё раз. Введи <b>ФИО</b>:",
-            parse_mode="HTML",
-        )
-        await state.set_state(Registration.waiting_full_name)
+        await callback.answer()
+        return
+
+    student = await db.get_student_by_id(verified["student_id"])
+    if not student:
+        await callback.answer("Ошибка: студент не найден.", show_alert=True)
+        return
+
+    if student.get("telegram_id"):
+        await callback.answer("Этот аккаунт уже зарегистрирован.", show_alert=True)
+        return
+
+    # Регистрируем!
+    await db.register_student_telegram(student["id"], callback.from_user.id)
+    await db.mark_token_used(verified["token"])
+    student = await db.get_student_by_id(student["id"])
+
+    await callback.message.answer(
+        f"🎉 <b>Добро пожаловать, {student['full_name']}!</b>\n\n"
+        f"📚 Группа: {student['group_name']}\n"
+        f"🔗 Твоя реферальная ссылка готова!\n\n"
+        f"Приглашай друзей и зарабатывай до <b>5 000 ₽</b> за каждого!",
+        parse_mode="HTML",
+    )
+    await show_main_menu(callback.message, student)
+    await callback.answer("Регистрация завершена!")
+
+
+# ─── Завершение регистрации (callback от web_server) ────────
+@router.callback_query(F.data == "complete_registration")
+async def cb_complete_registration(callback: CallbackQuery):
+    # Тот же механизм что и check_auth
+    await cb_check_auth(callback)
 
 
 async def show_main_menu(message: Message, student: dict):
     is_curator = student["role"] == "curator"
     await message.answer(
-        "📋 <b>Главное меню</b>",
+        "📋 <b>Главное меню</b>\n\n"
+        "Выбери, что тебя интересует:",
         reply_markup=main_menu_kb(is_curator),
         parse_mode="HTML",
+    )
+
+
+# ─── /help ──────────────────────────────────────────────────
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await send_help(message)
+
+
+@router.callback_query(F.data == "help")
+async def cb_help(callback: CallbackQuery):
+    await send_help(callback.message)
+    await callback.answer()
+
+
+async def send_help(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_menu")]
+    ])
+    await message.answer(
+        "💬 <b>Помощь</b>\n\n"
+        "<b>Как работает реферальная программа?</b>\n"
+        "Ты получаешь ссылку → отправляешь другу → он заполняет заявку → "
+        "мы связываемся с ним → при подписании договора тебе начисляется бонус.\n\n"
+        "<b>Сколько можно заработать?</b>\n"
+        "До 5 000 ₽ за каждого друга (1 000 ₽ за договор + 4 000 ₽ за оплату).\n\n"
+        "<b>Как получить выплату?</b>\n"
+        "Начисления видны в разделе «Мой баланс». Выплаты проводит бухгалтерия колледжа.\n\n"
+        "<b>Не могу зарегистрироваться?</b>\n"
+        "Убедись, что ты авторизовался на newlxp.ru. Если проблема сохраняется — напиши куратору.\n\n"
+        "<b>Нашёл ошибку?</b>\n"
+        "Напиши Арсену — @{admin_contact}\n\n"
+        "<b>Команды:</b>\n"
+        "/start — главное меню\n"
+        "/help — эта справка\n"
+        "/admin — панель администратора",
+        parse_mode="HTML",
+        reply_markup=kb,
     )
 
 
@@ -162,7 +233,6 @@ async def cb_my_link(callback: CallbackQuery):
         await callback.answer("Сначала зарегистрируйся!", show_alert=True)
         return
 
-    # QR-код
     qr_buf = generate_qr(student["ref_link"])
     qr_file = BufferedInputFile(qr_buf.read(), filename="qr.png")
 
@@ -171,24 +241,21 @@ async def cb_my_link(callback: CallbackQuery):
         f"Переходи по ссылке и оставляй заявку:\n{student['ref_link']}"
     )
 
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    share_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="📤 Поделиться",
-            switch_inline_query=share_text,
-        )],
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться", switch_inline_query=share_text)],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_menu")],
     ])
 
     await callback.message.answer_photo(
         photo=qr_file,
         caption=(
-            f"🔗 <b>Твоя реферальная ссылка:</b>\n"
+            f"🔗 <b>Твоя реферальная ссылка:</b>\n\n"
             f"<code>{student['ref_link']}</code>\n\n"
-            f"Покажи QR-код или отправь ссылку другу!"
+            f"📱 Покажи QR-код или отправь ссылку другу!\n"
+            f"💰 За каждого друга — до 5 000 ₽"
         ),
         parse_mode="HTML",
-        reply_markup=share_kb,
+        reply_markup=kb,
     )
     await callback.answer()
 
@@ -203,16 +270,19 @@ async def cb_my_referrals(callback: CallbackQuery):
 
     referrals = await db.get_referrals_by_referrer(student["id"])
     if not referrals:
-        text = "У тебя пока нет рефералов. Отправь свою ссылку друзьям! 🔗"
+        text = (
+            "👥 <b>Мои рефералы</b>\n\n"
+            "У тебя пока нет рефералов.\n"
+            "Отправь свою ссылку друзьям — нажми 🔗 <b>Моя ссылка</b>!"
+        )
     else:
-        lines = [f"👥 <b>Твои рефералы ({len(referrals)}):</b>\n"]
+        lines = [f"👥 <b>Мои рефералы</b> ({len(referrals)})\n"]
         for i, r in enumerate(referrals, 1):
-            status_label = STATUSES.get(r["status"], r["status"])
-            emoji = {"new": "📋", "consultation": "💬", "contract": "📝", "enrolled": "🎓"}.get(r["status"], "•")
-            lines.append(f"{i}. {r['full_name']} — {emoji} {status_label}")
+            emoji = STATUS_EMOJI.get(r["status"], "•")
+            status = STATUSES.get(r["status"], r["status"])
+            lines.append(f"  {i}. {r['full_name']} — {status}")
         text = "\n".join(lines)
 
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_menu")]
     ])
@@ -236,13 +306,13 @@ async def cb_my_balance(callback: CallbackQuery):
 
     lines = [
         f"💰 <b>Мой баланс</b>\n",
-        f"Начислено: <b>{earned} ₽</b>",
-        f"Выплачено: {paid} ₽",
-        f"К выплате: <b>{pending} ₽</b>",
+        f"┌ Начислено:  <b>{earned} ₽</b>",
+        f"├ Выплачено:  {paid} ₽",
+        f"└ К выплате:  <b>{pending} ₽</b>",
     ]
 
     if payments:
-        lines.append("\n📊 <b>Детализация:</b>")
+        lines.append("\n📊 <b>Последние начисления:</b>\n")
         type_labels = {
             "contract_referrer": "Договор",
             "enrolled_referrer": "Зачисление",
@@ -251,12 +321,9 @@ async def cb_my_balance(callback: CallbackQuery):
         }
         for p in payments[:10]:
             label = type_labels.get(p["type"], p["type"])
-            status = "✅" if p["status"] == "paid" else "⏳"
-            lines.append(
-                f"  {status} {p.get('referral_name', '?')} — {label}: {p['amount']} ₽"
-            )
+            icon = "✅" if p["status"] == "paid" else "⏳"
+            lines.append(f"  {icon} {p.get('referral_name', '?')} — {label}: {p['amount']} ₽")
 
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_menu")]
     ])
@@ -269,8 +336,6 @@ async def cb_my_balance(callback: CallbackQuery):
 async def cb_leaderboard(callback: CallbackQuery):
     student = await db.get_student_by_telegram_id(callback.from_user.id)
     text = await build_leaderboard_text(student)
-
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_menu")]
     ])
@@ -282,20 +347,19 @@ async def cb_leaderboard(callback: CallbackQuery):
 @router.callback_query(F.data == "rules")
 async def cb_rules(callback: CallbackQuery):
     text = (
-        "📖 <b>Правила реферальной программы IThub</b>\n\n"
-        "1️⃣ Получи свою реферальную ссылку или QR-код в боте.\n\n"
-        "2️⃣ Отправь ссылку другу — школьнику, который хочет учиться в IThub.\n\n"
-        "3️⃣ Друг переходит по ссылке и заполняет заявку.\n\n"
-        "4️⃣ Наш менеджер связывается с ним, проводит консультацию.\n\n"
-        "5️⃣ Если друг подписывает договор — тебе начисляется <b>1 000 ₽</b>, "
-        "а куратору твоей группы — 500 ₽.\n\n"
-        "6️⃣ Когда друг оплачивает и начинает учиться (сентябрь) — "
-        "тебе ещё <b>4 000 ₽</b>, куратору — ещё 500 ₽.\n\n"
-        "💰 <b>Итого за одного друга: до 5 000 ₽!</b>\n\n"
-        "⚠️ Один номер телефона = один реферал. "
-        "Реферал принадлежит тому, кто первым пригласил."
+        "📖 <b>Правила реферальной программы</b>\n\n"
+        "┌ 1. Получи ссылку в разделе 🔗 Моя ссылка\n"
+        "├ 2. Отправь её другу-школьнику\n"
+        "├ 3. Друг заполняет заявку в боте\n"
+        "├ 4. Наш менеджер проведёт консультацию\n"
+        "├ 5. Договор → тебе <b>1 000 ₽</b>\n"
+        "└ 6. Начало учёбы → тебе ещё <b>4 000 ₽</b>\n\n"
+        "💰 <b>Итого: до 5 000 ₽ за каждого друга!</b>\n\n"
+        "⚠️ <b>Важно:</b>\n"
+        "• Один телефон = один реферал\n"
+        "• Реферал принадлежит тому, кто пригласил первым\n"
+        "• Куратор группы тоже получает бонус: 500 ₽ × 2"
     )
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_menu")]
     ])
@@ -308,10 +372,5 @@ async def cb_rules(callback: CallbackQuery):
 async def cb_back_menu(callback: CallbackQuery):
     student = await db.get_student_by_telegram_id(callback.from_user.id)
     if student:
-        is_curator = student["role"] == "curator"
-        await callback.message.answer(
-            "📋 <b>Главное меню</b>",
-            reply_markup=main_menu_kb(is_curator),
-            parse_mode="HTML",
-        )
+        await show_main_menu(callback.message, student)
     await callback.answer()

@@ -1,34 +1,46 @@
 #!/bin/bash
-# ═══════════════════════════════════════════════════════════════
-#  ОБНОВЛЕНИЕ БОТА — после git push на GitHub
-#
-#  Тянет новый код из GitHub и перезапускает бота.
-#
-#  Использование (на сервере):
-#    sudo /opt/ithub_ref_bot/update.sh
-# ═══════════════════════════════════════════════════════════════
-
 set -e
 
-APP_DIR="/opt/ithub_ref_bot"
+# Update script for ithub_ref_bot
+# Updates code from git and restarts the service
+
 SERVICE_NAME="ithub-ref-bot"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "⏸  Останавливаю бота..."
-systemctl stop "$SERVICE_NAME"
+echo "================================================"
+echo "ithub_ref_bot Update Script"
+echo "================================================"
+echo ""
 
-echo "📥 Тяну обновления из GitHub..."
-cd "$APP_DIR"
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+    echo "❌ This script must be run as root"
+    exit 1
+fi
+
+cd "$SCRIPT_DIR"
+
+echo "📥 Pulling latest changes from git..."
 git pull origin main
 
-echo "📦 Обновляю зависимости..."
-venv/bin/pip install -r requirements.txt -q
+# Activate virtual environment
+source venv/bin/activate
 
-echo "🔑 Права..."
-chown -R ithub_bot:ithub_bot "$APP_DIR"
+echo "📦 Installing/updating dependencies..."
+pip install --upgrade pip
+pip install -r requirements.txt
 
-echo "▶️  Запускаю бота..."
-systemctl start "$SERVICE_NAME"
+echo "🔄 Restarting service..."
+systemctl restart $SERVICE_NAME
 
 echo ""
-echo "✅ Бот обновлён и перезапущен!"
-systemctl status "$SERVICE_NAME" --no-pager
+echo "================================================"
+echo "✅ Update Complete!"
+echo "================================================"
+echo ""
+echo "Service status:"
+systemctl status $SERVICE_NAME --no-pager
+echo ""
+echo "View logs:"
+echo "  journalctl -u $SERVICE_NAME -f"
+echo ""

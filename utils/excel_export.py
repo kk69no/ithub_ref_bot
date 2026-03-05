@@ -1,84 +1,188 @@
-"""
-Экспорт данных в Excel (.xlsx) через openpyxl.
-"""
+"""Excel export functionality for referrals and payments data."""
+
 import io
+from datetime import datetime
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-
-from config import STATUSES
-
-
-HEADER_FILL = PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid")
-HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
-THIN_BORDER = Border(
-    left=Side(style="thin"),
-    right=Side(style="thin"),
-    top=Side(style="thin"),
-    bottom=Side(style="thin"),
-)
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 
-def _style_header(ws, headers: list[str]):
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center")
-        cell.border = THIN_BORDER
+async def export_full_report(db) -> io.BytesIO:
+    """Export full referrals and payments report to Excel.
 
+    Args:
+        db: Database connection
 
-async def export_full_report(referrals: list[dict], payments: list[dict]) -> io.BytesIO:
+    Returns:
+        BytesIO object containing XLSX file
     """
-    Экспорт в Excel: лист «Абитуриенты» и лист «Начисления».
-    Возвращает BytesIO с .xlsx.
-    """
-    wb = Workbook()
+    workbook = Workbook()
 
-    # ─── Лист «Абитуриенты» ──────────────────────────
-    ws1 = wb.active
-    ws1.title = "Абитуриенты"
-    headers1 = ["ID", "ФИО абитуриента", "Телефон", "Класс", "Школа",
-                 "Статус", "Реферер", "Группа реферера", "Дата заявки"]
-    _style_header(ws1, headers1)
-    for i, r in enumerate(referrals, 2):
-        ws1.cell(row=i, column=1, value=r["id"]).border = THIN_BORDER
-        ws1.cell(row=i, column=2, value=r["full_name"]).border = THIN_BORDER
-        ws1.cell(row=i, column=3, value=r["phone"]).border = THIN_BORDER
-        ws1.cell(row=i, column=4, value=r.get("grade", "")).border = THIN_BORDER
-        ws1.cell(row=i, column=5, value=r.get("school", "")).border = THIN_BORDER
-        ws1.cell(row=i, column=6, value=STATUSES.get(r["status"], r["status"])).border = THIN_BORDER
-        ws1.cell(row=i, column=7, value=r.get("referrer_name", "")).border = THIN_BORDER
-        ws1.cell(row=i, column=8, value=r.get("group_name", "")).border = THIN_BORDER
-        ws1.cell(row=i, column=9, value=r["created_at"]).border = THIN_BORDER
+    # Remove default sheet
+    if "Sheet" in workbook.sheetnames:
+        workbook.remove(workbook["Sheet"])
 
-    for col in range(1, len(headers1) + 1):
-        ws1.column_dimensions[chr(64 + col)].width = 18
+    # Create sheets
+    await _create_students_sheet(workbook, db)
+    await _create_referrals_sheet(workbook, db)
+    await _create_payments_sheet(workbook, db)
 
-    # ─── Лист «Начисления» ───────────────────────────
-    ws2 = wb.create_sheet("Начисления")
-    headers2 = ["ID", "Получатель", "За абитуриента", "Сумма (₽)",
-                 "Тип", "Статус", "Дата начисления", "Дата выплаты"]
-    _style_header(ws2, headers2)
-    type_labels = {
-        "contract_referrer": "Договор (студент)",
-        "contract_curator": "Договор (куратор)",
-        "enrolled_referrer": "Зачисление (студент)",
-        "enrolled_curator": "Зачисление (куратор)",
-    }
-    for i, p in enumerate(payments, 2):
-        ws2.cell(row=i, column=1, value=p["id"]).border = THIN_BORDER
-        ws2.cell(row=i, column=2, value=p.get("recipient_name", "")).border = THIN_BORDER
-        ws2.cell(row=i, column=3, value=p.get("referral_name", "")).border = THIN_BORDER
-        ws2.cell(row=i, column=4, value=p["amount"]).border = THIN_BORDER
-        ws2.cell(row=i, column=5, value=type_labels.get(p["type"], p["type"])).border = THIN_BORDER
-        ws2.cell(row=i, column=6, value="Выплачено" if p["status"] == "paid" else "К выплате").border = THIN_BORDER
-        ws2.cell(row=i, column=7, value=p["created_at"]).border = THIN_BORDER
-        ws2.cell(row=i, column=8, value=p.get("paid_at", "")).border = THIN_BORDER
+    # Save to BytesIO
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
 
-    for col in range(1, len(headers2) + 1):
-        ws2.column_dimensions[chr(64 + col)].width = 20
+    return output
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
+
+async def _create_students_sheet(workbook, db):
+    """Create students sheet."""
+    ws = workbook.create_sheet("Студенты")
+
+    # Headers
+    headers = ["ID", "Имя", "Группа", "Email", "Статус", "Дата создания", "Рефералов"]
+    ws.append(headers)
+
+    # Style headers
+    _style_headers(ws, len(headers))
+
+    # Get data
+    students = await db.fetchall(
+        """
+        SELECT s.user_id, s.name, s.group, s.email, s.status, s.created_at,
+               COUNT(r.id) as referral_count
+        FROM students s
+        LEFT JOIN referrals r ON s.user_id = r.curator_id
+        GROUP BY s.user_id
+        ORDER BY s.name
+        """
+    )
+
+    # Add data
+    for student in students:
+        ws.append([
+            student['user_id'],
+            student['name'],
+            student['group'],
+            student['email'],
+            student['status'],
+            student['created_at'],
+            student['referral_count'] or 0
+        ])
+
+    # Auto-width columns
+    _auto_width_columns(ws)
+
+
+async def _create_referrals_sheet(workbook, db):
+    """Create referrals sheet."""
+    ws = workbook.create_sheet("Рефералы")
+
+    # Headers
+    headers = ["ID", "Студент", "Куратор", "Статус", "Дата создания"]
+    ws.append(headers)
+
+    # Style headers
+    _style_headers(ws, len(headers))
+
+    # Get data
+    referrals = await db.fetchall(
+        """
+        SELECT r.id, s.name as student_name, c.name as curator_name, r.status, r.created_at
+        FROM referrals r
+        JOIN students s ON r.student_id = s.user_id
+        JOIN students c ON r.curator_id = c.user_id
+        ORDER BY r.created_at DESC
+        """
+    )
+
+    # Add data
+    for ref in referrals:
+        ws.append([
+            ref['id'],
+            ref['student_name'],
+            ref['curator_name'],
+            ref['status'],
+            ref['created_at']
+        ])
+
+    # Auto-width columns
+    _auto_width_columns(ws)
+
+
+async def _create_payments_sheet(workbook, db):
+    """Create payments sheet."""
+    ws = workbook.create_sheet("Платежи")
+
+    # Headers
+    headers = ["ID", "Студент", "Сумма", "Причина", "Статус", "Дата"]
+    ws.append(headers)
+
+    # Style headers
+    _style_headers(ws, len(headers))
+
+    # Get data
+    payments = await db.fetchall(
+        """
+        SELECT p.id, s.name, p.amount, p.reason, p.status, p.created_at
+        FROM payments p
+        JOIN students s ON p.user_id = s.user_id
+        ORDER BY p.created_at DESC
+        """
+    )
+
+    # Add data with currency formatting
+    for payment in payments:
+        row = ws.max_row + 1
+        ws[f"A{row}"] = payment['id']
+        ws[f"B{row}"] = payment['name']
+        ws[f"C{row}"] = payment['amount']
+        ws[f"C{row}"].number_format = '#,##0.00 "₽"'
+        ws[f"D{row}"] = payment['reason']
+        ws[f"E{row}"] = payment['status']
+        ws[f"F{row}"] = payment['created_at']
+
+    # Auto-width columns
+    _auto_width_columns(ws)
+
+
+def _style_headers(ws, column_count):
+    """Apply header styling."""
+    header_fill = PatternFill(
+        start_color="366092",
+        end_color="366092",
+        fill_type="solid"
+    )
+    header_font = Font(bold=True, color="FFFFFF")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin")
+    )
+
+    for col in range(1, column_count + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+
+def _auto_width_columns(ws):
+    """Auto-adjust column widths."""
+    for column in ws.columns:
+        max_length = 0
+        column_letter = get_column_letter(column[0].column)
+
+        for cell in column:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except Exception:
+                pass
+
+        adjusted_width = min(max_length + 2, 50)
+        ws.column_dimensions[column_letter].width = adjusted_width

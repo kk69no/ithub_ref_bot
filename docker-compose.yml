@@ -1,14 +1,39 @@
-version: "3.8"
+version: '3.8'
 
 services:
   bot:
-    build: .
-    restart: unless-stopped
-    env_file:
-      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ithub-ref-bot
+    restart: always
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - DATABASE_PATH=/app/data/bot.db
+      - WEBHOOK_PORT=${WEBHOOK_PORT:-8443}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - ADMIN_NOTIFY_CHAT_ID=${ADMIN_NOTIFY_CHAT_ID}
+      - PAYMENT_MIN=${PAYMENT_MIN:-100}
+      - PAYMENT_MAX=${PAYMENT_MAX:-10000}
+      - PAYMENT_DEFAULT=${PAYMENT_DEFAULT:-500}
+      - NEWLXP_URL=${NEWLXP_URL}
+      - API_KEY=${API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "${WEBHOOK_PORT:-8443}:${WEBHOOK_PORT:-8443}"
     volumes:
-      - bot_data:/app/data
-      - ./logo.png:/app/logo.png:ro
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${WEBHOOK_PORT:-8443}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - bot-network
 
-volumes:
-  bot_data:
+networks:
+  bot-network:
+    driver: bridge
