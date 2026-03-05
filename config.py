@@ -23,9 +23,15 @@ REF_LINK_TEMPLATE = f"https://t.me/{BOT_USERNAME}?start={{ref_code}}"
 
 # ─── OAuth через newlxp ────────────────────────────────────
 NEWLXP_URL = os.getenv("NEWLXP_URL", "https://newlxp.ru")
-NEWLXP_AUTH_URL = NEWLXP_URL + "/telegram-auth?token={token}"
+# Страница авторизации на нашем VPS (студент вводит email+пароль от newlxp)
+VPS_HOST = os.getenv("VPS_HOST", "")  # Укажите IP или домен VPS
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8443"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "ithub-ref-bot-secret-key-2026")
+
+# URL для кнопки "Войти через newlxp" в боте
+# Если VPS_HOST задан — используем его, иначе http://localhost
+_auth_base = f"http://{VPS_HOST}:{WEBHOOK_PORT}" if VPS_HOST else f"http://localhost:{WEBHOOK_PORT}"
+NEWLXP_AUTH_URL = _auth_base + "/auth?token={token}"
 
 # ─── Выплаты ────────────────────────────────────────────────
 PAYMENT_CONTRACT_STUDENT = 1000
