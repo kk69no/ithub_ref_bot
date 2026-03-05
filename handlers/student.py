@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 
 import database as db
 from config import ADMIN_IDS, STATUSES, STATUS_EMOJI, NEWLXP_AUTH_URL
-from utils.qr_generator import generate_qr
+from utils.qr_generator import generate_qr_simple
 from handlers.leaderboard import build_leaderboard_text
 from handlers.applicant import ApplicantForm
 
@@ -215,7 +215,7 @@ async def send_help(message: Message):
         "<b>Не могу зарегистрироваться?</b>\n"
         "Убедись, что ты авторизовался на newlxp.ru. Если проблема сохраняется — напиши куратору.\n\n"
         "<b>Нашёл ошибку?</b>\n"
-        "Напиши Арсену — @{admin_contact}\n\n"
+        "По любым вопросам обращайся к администратору.\n\n"
         "<b>Команды:</b>\n"
         "/start — главное меню\n"
         "/help — эта справка\n"
@@ -233,7 +233,7 @@ async def cb_my_link(callback: CallbackQuery):
         await callback.answer("Сначала зарегистрируйся!", show_alert=True)
         return
 
-    qr_buf = generate_qr(student["ref_link"])
+    qr_buf = await generate_qr_simple(student["ref_link"])
     qr_file = BufferedInputFile(qr_buf.read(), filename="qr.png")
 
     share_text = (

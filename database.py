@@ -211,17 +211,20 @@ async def find_student_by_name_and_group(full_name: str, group_name: str) -> dic
         return dict(row) if row else None
 
 
-async def fuzzy_find_students(query: str, threshold: float = 0.6) -> list[dict]:
+async def fuzzy_find_students(query: str, threshold: float = 0.6,
+                              only_unregistered: bool = False) -> list[dict]:
     """
     Нечёткий поиск по ФИО.
-    Возвращает список совпадений с score >= threshold, отсортированных по score.
+    only_unregistered=True — ищет только без telegram_id (для OAuth-привязки).
+    По умолчанию ищет среди ВСЕХ студентов.
     """
     query_lower = query.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM students WHERE telegram_id IS NULL"
-        )
+        sql = "SELECT * FROM students"
+        if only_unregistered:
+            sql += " WHERE telegram_id IS NULL"
+        cur = await db.execute(sql)
         rows = await cur.fetchall()
 
     results = []
@@ -259,19 +262,24 @@ async def register_student_telegram(student_id: int, telegram_id: int):
 async def add_student(full_name: str, group_name: str, role: str = "student",
                       telegram_id: int | None = None, curator_id: int | None = None) -> dict:
     from config import REF_LINK_TEMPLATE
-    ref_code = _generate_ref_code()
-    ref_link = REF_LINK_TEMPLATE.format(ref_code=ref_code)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """INSERT INTO students (telegram_id, full_name, group_name, curator_id,
-                                    ref_code, ref_link, role)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (telegram_id, full_name.strip(), group_name.strip(),
-             curator_id, ref_code, ref_link, role),
-        )
-        await db.commit()
-        student_id = cur.lastrowid
-    return await get_student_by_id(student_id)
+    for _attempt in range(10):  # retry при коллизии ref_code
+        ref_code = _generate_ref_code()
+        ref_link = REF_LINK_TEMPLATE.format(ref_code=ref_code)
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    """INSERT INTO students (telegram_id, full_name, group_name, curator_id,
+                                            ref_code, ref_link, role)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (telegram_id, full_name.strip(), group_name.strip(),
+                     curator_id, ref_code, ref_link, role),
+                )
+                await db.commit()
+                student_id = cur.lastrowid
+            return await get_student_by_id(student_id)
+        except aiosqlite.IntegrityError:
+            continue  # ref_code collision, retry
+    raise RuntimeError("Could not generate unique ref_code after 10 attempts")
 
 
 async def get_all_students() -> list[dict]:

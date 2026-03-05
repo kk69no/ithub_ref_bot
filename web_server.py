@@ -61,7 +61,7 @@ async def handle_verify(request: web.Request) -> web.Response:
 
     if not student:
         # Пробуем fuzzy поиск
-        fuzzy = await db.fuzzy_find_students(student_name)
+        fuzzy = await db.fuzzy_find_students(student_name, only_unregistered=True)
         if fuzzy and student_group:
             # Фильтруем по группе
             for f in fuzzy:
