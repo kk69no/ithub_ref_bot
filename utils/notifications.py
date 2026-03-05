@@ -1,191 +1,52 @@
-"""Notification utilities for admins, students, and curators."""
-
-from config import ADMIN_IDS, ADMIN_NOTIFY_CHAT_ID, STATUSES
-
-
-async def notify_admin(message: str, bot=None) -> bool:
-    """Send notification to admin chat.
-
-    Args:
-        message: Message text
-        bot: Aiogram bot instance
-
-    Returns:
-        True if sent successfully, False otherwise
-    """
-    if not bot or not ADMIN_NOTIFY_CHAT_ID:
-        return False
-
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_NOTIFY_CHAT_ID,
-            text=message,
-            parse_mode="Markdown"
-        )
-        return True
-    except Exception:
-        return False
+"""
+Утилиты для уведомлений.
+"""
+from aiogram import Bot
+from config import ADMIN_IDS
 
 
-async def notify_admins_list(message: str, bot=None) -> int:
-    """Send notification to all admins in list.
-
-    Args:
-        message: Message text
-        bot: Aiogram bot instance
-
-    Returns:
-        Number of admins notified
-    """
-    if not bot or not ADMIN_IDS:
-        return 0
-
-    sent = 0
+async def notify_new_referral(bot: Bot, referral: dict, referrer: dict):
+    """Уведомить админов о новом реферале."""
+    text = (
+        f"📋 <b>Новый реферал!</b>\n\n"
+        f"👤 {referral['full_name']}\n"
+        f"📞 {referral['phone']}\n"
+        f"🎓 Класс: {referral.get('grade', '?')}\n"
+        f"🏫 Школа: {referral.get('school', '?')}\n\n"
+        f"🔗 Привёл: {referrer['full_name']} ({referrer['group_name']})"
+    )
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=message,
-                parse_mode="Markdown"
-            )
-            sent += 1
+            await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception:
             pass
 
-    return sent
 
-
-async def notify_student(user_id: int, message: str, bot=None) -> bool:
-    """Send notification to student.
-
-    Args:
-        user_id: Student user ID
-        message: Message text
-        bot: Aiogram bot instance
-
-    Returns:
-        True if sent successfully, False otherwise
-    """
-    if not bot:
-        return False
-
+async def notify_student_new_referral(bot: Bot, telegram_id: int, applicant_name: str):
+    """Уведомить студента что кто-то заполнил заявку по его ссылке."""
     try:
         await bot.send_message(
-            chat_id=user_id,
-            text=message,
-            parse_mode="Markdown"
+            telegram_id,
+            f"🎉 <b>Новый реферал!</b>\n\n"
+            f"<b>{applicant_name}</b> заполнил заявку по твоей ссылке.\n"
+            f"Мы свяжемся с ним — следи за статусом!",
+            parse_mode="HTML",
         )
-        return True
     except Exception:
-        return False
+        pass
 
 
-async def notify_curator(user_id: int, message: str, bot=None) -> bool:
-    """Send notification to curator.
-
-    Args:
-        user_id: Curator user ID
-        message: Message text
-        bot: Aiogram bot instance
-
-    Returns:
-        True if sent successfully, False otherwise
-    """
-    if not bot:
-        return False
-
+async def notify_curator_new_referral(
+    bot: Bot, curator_tg_id: int,
+    referrer_name: str, applicant_name: str,
+):
+    """Уведомить куратора о новом реферале в его группе."""
     try:
         await bot.send_message(
-            chat_id=user_id,
-            text=message,
-            parse_mode="Markdown"
+            curator_tg_id,
+            f"📋 <b>Новый реферал в группе</b>\n\n"
+            f"Студент <b>{referrer_name}</b> привёл <b>{applicant_name}</b>.",
+            parse_mode="HTML",
         )
-        return True
     except Exception:
-        return False
-
-
-async def notify_group(group_id: int, message: str, db=None, bot=None) -> int:
-    """Send notification to all students in group.
-
-    Args:
-        group_id: Group ID
-        message: Message text
-        db: Database connection
-        bot: Aiogram bot instance
-
-    Returns:
-        Number of students notified
-    """
-    if not db or not bot:
-        return 0
-
-    students = await db.fetchall(
-        "SELECT user_id FROM students WHERE group = ?",
-        [group_id]
-    )
-
-    sent = 0
-    for student in students:
-        try:
-            await bot.send_message(
-                chat_id=student['user_id'],
-                text=message,
-                parse_mode="Markdown"
-            )
-            sent += 1
-        except Exception:
-            pass
-
-    return sent
-
-
-async def notify_status_change(user_id: int, old_status: str, new_status: str, bot=None) -> bool:
-    """Send status change notification.
-
-    Args:
-        user_id: User ID
-        old_status: Previous status
-        new_status: New status
-        bot: Aiogram bot instance
-
-    Returns:
-        True if sent successfully, False otherwise
-    """
-    message = f"📝 Ваш статус изменен:\n`{old_status}` → `{new_status}`"
-    return await notify_student(user_id, message, bot)
-
-
-async def notify_payment(user_id: int, amount: float, reason: str = None, bot=None) -> bool:
-    """Send payment notification.
-
-    Args:
-        user_id: User ID
-        amount: Payment amount
-        reason: Optional payment reason
-        bot: Aiogram bot instance
-
-    Returns:
-        True if sent successfully, False otherwise
-    """
-    message = f"💰 Вам выполнена выплата на сумму *{amount}₽*"
-
-    if reason:
-        message += f"\n\nПричина: {reason}"
-
-    return await notify_student(user_id, message, bot)
-
-
-async def notify_referral_status(student_id: int, new_status: str, bot=None) -> bool:
-    """Send referral status change notification.
-
-    Args:
-        student_id: Student ID
-        new_status: New status
-        bot: Aiogram bot instance
-
-    Returns:
-        True if sent successfully, False otherwise
-    """
-    message = f"🔗 Ваш реферал обновлен: *{new_status}*"
-    return await notify_student(student_id, message, bot)
+        pass

@@ -1,60 +1,54 @@
-"""Main entry point for the referral bot.
-
-Runs both the aiogram bot polling and the aiohttp web server concurrently.
 """
-
+Точка входа: aiogram polling + aiohttp веб-сервер (OAuth callback).
+"""
 import asyncio
 import logging
+
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiohttp import web
 
 from config import BOT_TOKEN, WEBHOOK_PORT
+import database as db
 import web_server
-from handlers import leaderboard, curator, admin
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
 async def main():
-    """Main function to run bot and web server concurrently."""
+    # Инициализируем БД
+    await db.init_db()
 
-    # Initialize bot and dispatcher
+    # Бот + диспетчер
     bot = Bot(token=BOT_TOKEN)
-    storage = MemoryStorage()
-    dp = Dispatcher(storage=storage)
+    dp = Dispatcher(storage=MemoryStorage())
 
-    # Register handlers
+    # Подключаем роутеры (порядок важен!)
+    from handlers import student, applicant, leaderboard, curator, admin
+    dp.include_router(student.router)
+    dp.include_router(applicant.router)
     dp.include_router(leaderboard.router)
     dp.include_router(curator.router)
     dp.include_router(admin.router)
 
-    # Set bot reference in web_server for webhook handling
+    # Передаём бот в web_server для отправки уведомлений
     web_server.set_bot(bot)
 
-    # Create aiohttp app
-    app = web.Application()
-    app.router.add_post('/webhook', web_server.webhook_handler)
-    app.router.add_get('/health', web_server.health_handler)
-
-    # Create web runner
+    # Запускаем aiohttp для OAuth-callback
+    from aiohttp import web
+    app = web_server.create_app()
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', WEBHOOK_PORT)
+    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
 
     try:
-        # Start web server
         await site.start()
-        logger.info(f"Web server started on port {WEBHOOK_PORT}")
-
-        # Start bot polling
+        logger.info("Web server started on port %s", WEBHOOK_PORT)
         logger.info("Bot polling started")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
     finally:
         await runner.cleanup()
         await bot.session.close()
