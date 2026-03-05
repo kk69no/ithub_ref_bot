@@ -39,7 +39,9 @@ query SignIn($input: SignInInput!) {
       roles
       student {
         learningGroups {
-          name
+          learningGroup {
+            name
+          }
         }
       }
     }
@@ -165,10 +167,13 @@ async def handle_auth_verify(request: web.Request) -> web.Response:
     name_parts = [last_name, first_name, middle_name]
     student_name = " ".join(p for p in name_parts if p).strip()
 
-    # Группа из student.learningGroups
+    # Группа из student.learningGroups[].learningGroup.name
     student_data = user.get("student") or {}
     learning_groups = student_data.get("learningGroups") or []
-    student_group = learning_groups[0]["name"] if learning_groups else ""
+    student_group = ""
+    if learning_groups:
+        lg = learning_groups[0].get("learningGroup") or {}
+        student_group = lg.get("name", "")
 
     if not student_name:
         student_name = email  # fallback
